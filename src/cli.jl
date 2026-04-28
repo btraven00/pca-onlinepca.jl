@@ -1,23 +1,28 @@
 """
-Argument parser for omnibenchmark OnlinePCA.jl modules.
+Argument parser for omnibenchmark OnlinePCA.jl module.
 
-Conventions match the sibling scanpy module:
+Conventions:
 - All arguments are required. No defaults — callers (omnibenchmark configs)
-  must pass everything explicitly so runs are fully reproducible from the
-  invocation line.
+  must pass everything explicitly so runs are fully reproducible.
 - ArgParse rejects unknown flags by default; we rely on that for strictness.
+
+OnlinePCA.jl is integer-counts-only (its `loadchromium` reads
+matrix/data into a Vector{Int64}). We therefore consume the raw count
+matrix from the upstream `datasets` stage (h5ad `/layers/counts`),
+apply filtering + gene selection, and feed integer counts into
+`tenxpca`. The `--solver` value selects the on-the-fly scale variant.
 """
 
 module CLI
 
 using ArgParse
 
-export build_pca_parser
+export build_pca_parser, VALID_SOLVERS
 
-const VALID_SOLVERS = ["halko", "ccipca", "orthiter", "arnoldi", "algorithm971"]
+const VALID_SOLVERS = ["tenxpca_sqrt", "tenxpca_log", "tenxpca_raw"]
 
 function build_pca_parser()
-    s = ArgParseSettings(description = "OmniBenchmark PCA module (OnlinePCA.jl)",
+    s = ArgParseSettings(description = "OmniBenchmark PCA module (OnlinePCA.jl, raw-counts)",
                          autofix_names = false)
 
     @add_arg_table! s begin
@@ -29,9 +34,14 @@ function build_pca_parser()
             help = "Module name/identifier"
             arg_type = String
             required = true
-        "--normalized.h5"
-            dest_name = "normalized_h5"
-            help = "TENx-format HDF5 of normalized expression (genes x cells)"
+        "--rawdata.h5ad"
+            dest_name = "rawdata_h5ad"
+            help = "h5ad with /layers/counts (cells x genes, integer)"
+            arg_type = String
+            required = true
+        "--filtered.cellids"
+            dest_name = "filtered_cellids"
+            help = "Gzipped text file of kept cell barcodes (one per line)"
             arg_type = String
             required = true
         "--selected.genes"
@@ -40,7 +50,7 @@ function build_pca_parser()
             arg_type = String
             required = true
         "--solver"
-            help = "PCA solver: " * join(VALID_SOLVERS, ", ")
+            help = "OnlinePCA.jl scale variant: " * join(VALID_SOLVERS, ", ")
             arg_type = String
             required = true
             range_tester = (x -> x in VALID_SOLVERS)

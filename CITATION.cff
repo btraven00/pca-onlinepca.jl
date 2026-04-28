@@ -5,8 +5,8 @@ title: "OnlinePCA.jl module"
 abstract: |
   An OnlinePCA.jl wrapper module for omnibenchmark scRNA pipelines.
 authors:
-  - family-names: "ben"
-    given-names: ""
+  - family-names: "carrillo"
+    given-names: "ben"
     email: "ben.uzh@proton.me"
 date-released: "2026-04-29"
 version: "0.1.0"

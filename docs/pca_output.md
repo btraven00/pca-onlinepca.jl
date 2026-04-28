@@ -24,13 +24,15 @@ Flat HDF5 — intentionally not h5ad — so R (`rhdf5` / `HDF5Array`) and Julia 
 | `format_version` | string | Always `"1"` for this spec |
 | `tool` | string | `OnlinePCA.jl` for this module |
 | `tool_version` | string | Version of OnlinePCA.jl |
-| `solver` | string | One of `halko`, `ccipca`, `orthiter`, `arnoldi`, `algorithm971` |
+| `solver` | string | One of `tenxpca_sqrt`, `tenxpca_log`, `tenxpca_raw` — the `tenxpca` randomized SVD with the named on-the-fly scale variant applied to the raw count matrix |
 | `n_components` | int | Number of PCs computed |
 | `random_seed` | int | Random seed passed to the solver |
 
 ## Preprocessing
 
-Genes are centered and scaled (per-gene zero-mean, unit-variance) before PCA. The input matrix is subsetted to the selected genes before scaling. OnlinePCA.jl is then invoked with `scale="raw"` so it does not reapply transformations on top of the already-scaled values.
+Input is the raw count matrix from the `datasets` stage (`/layers/counts` in the h5ad), filtered to `filtered.cellids` and subsetted to `selected.genes` in this module. The integer counts are written to a temporary TENx-format HDF5; `tenxsumr` computes per-row means and `tenxpca` performs randomized SVD with the chosen `scale` variant (`sqrt`, `log`, `raw`). Per-row centering uses the corresponding mean file (`Feature_SqrtMeans.csv`, `Feature_LogMeans.csv`, or `Feature_Means.csv`).
+
+This differs from the scanpy / scrapper PCA modules, which consume the already-normalized matrix from the `three-normalize` stage. OnlinePCA.jl is integer-counts-only by design (its `loadchromium` reads matrix/data into a `Vector{Int64}` for memory-efficient OOC streaming), and bundles normalization into the streaming PCA pass via the `scale` argument.
 
 ## Validation
 

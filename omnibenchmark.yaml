@@ -1,4 +1,4 @@
 # OmniBenchmark Module Configuration
 
 entrypoints:
-  pca: pca.jl
+  pca: pca.sh

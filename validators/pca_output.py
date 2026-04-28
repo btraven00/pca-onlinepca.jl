@@ -35,7 +35,7 @@ REQUIRED_ATTRS = {"format_version", "tool", "tool_version", "solver",
 VALID_SOLVERS_BY_TOOL = {
     "scanpy":       {"arpack", "randomized"},
     "scrapper":     {"irlba"},
-    "OnlinePCA.jl": {"halko", "ccipca", "orthiter", "arnoldi", "algorithm971"},
+    "OnlinePCA.jl": {"tenxpca_sqrt", "tenxpca_log", "tenxpca_raw"},
 }
 
 
