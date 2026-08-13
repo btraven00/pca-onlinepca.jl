@@ -2,16 +2,20 @@
 """
 PCA module (OnlinePCA.jl-backed) for omnibenchmark — raw-counts variant.
 
-Output format: shared neutral HDF5 v1 (see `docs/pca_output.md`).
-File: {output_dir}/{name}_{solver}_n_{n_components}.h5
+Outputs, per the PCA stage contract:
+  {output_dir}/{name}_pcas.tsv       cell_id + one column per PC
+  {output_dir}/{name}_loadings.tsv   gene_id + one column per PC
+plus the shared neutral HDF5 v1 (see `docs/pca_output.md`), which is not
+declared by the stage but is the only place the eigenvalues survive.
 
 Pipeline
 --------
 1. Read `/layers/counts` from the upstream h5ad (dense integer counts,
    cells x genes), plus `/obs/_index` (cell ids) and `/var/_index`
    (gene ids).
-2. Apply `filtered.cellids` to drop unfiltered cells.
-3. Apply `selected.genes` to drop unselected genes.
+2. Apply `filtered_cellids` to drop unfiltered cells.
+3. Apply the HVG set — read from `matrix/genes` of
+   `normalized_selected_h5` — to drop unselected genes.
 4. Build a sparse (genes x cells) Int matrix and write it to a temp
    TENx-format HDF5 that OnlinePCA.jl's `tenxpca` / `tenxsumr` can read.
 5. `tenxsumr` computes per-row means; `tenxpca` runs the randomized SVD
@@ -50,19 +54,63 @@ function load_lines(path::AbstractString)
 end
 
 """
-Read raw counts + ids from an h5ad written by anndataR.
+Read the selected gene ids from a TENx-format H5 (`writeTENxMatrix(group="matrix")`,
+genes x cells). Only `matrix/genes` is touched — the normalized values are
+deliberately ignored, since OnlinePCA.jl scales raw counts itself.
+"""
+function load_selected_genes(path::AbstractString)
+    h5open(path, "r") do h5
+        haskey(h5, TENX_GROUP) && haskey(h5[TENX_GROUP], "genes") ||
+            error("expected /$TENX_GROUP/genes in $path")
+        return String.(read(h5[TENX_GROUP]["genes"]))
+    end
+end
 
-Returns (X::Matrix{Int}, cell_ids::Vector{String}, gene_ids::Vector{String})
-where X is (n_genes, n_cells) — h5ad on-disk is row-major (cells, genes),
-which HDF5.jl reads column-major as (genes, cells).
+"""
+Read raw counts + ids from an h5ad.
+
+Returns (X, cell_ids, gene_ids) with X (n_genes, n_cells).
+
+`/layers/counts` is usually an AnnData CSR group (`encoding-type = csr_matrix`,
+`shape = [n_obs, n_vars]`, i.e. cells x genes) rather than a dense array —
+every fixture in this benchmark is stored that way, and HDF5.jl reads a group
+as a Dict, so the dense path silently yields a Dict instead of a matrix.
+
+The transpose is free: CSR of A is bit-for-bit CSC of Aᵀ. Reading
+(data, indices, indptr) straight into a SparseMatrixCSC therefore gives the
+(genes x cells) orientation we want, with no copy and no permutation.
+
+Note `X` itself is absent from these files (`X: None` is legal AnnData); the
+counts only ever live in the layer, so there is no fallback to fall back to.
 """
 function load_h5ad_counts(path::AbstractString)
     h5open(path, "r") do h5
         haskey(h5, "layers") && haskey(h5["layers"], "counts") ||
             error("expected /layers/counts in $path")
-        counts = read(h5["layers"]["counts"])
+        obj = h5["layers"]["counts"]
         cell_ids = String.(read(h5["obs"]["_index"]))
         gene_ids = String.(read(h5["var"]["_index"]))
+
+        counts = if obj isa HDF5.Group
+            enc = haskey(attrs(obj), "encoding-type") ? attrs(obj)["encoding-type"] : ""
+            enc == "csr_matrix" ||
+                error("/layers/counts is a $enc group; only csr_matrix (cells x genes) is supported")
+            shape = attrs(obj)["shape"]                # [n_obs, n_vars] = [cells, genes]
+            n_cells, n_genes = Int(shape[1]), Int(shape[2])
+            data    = read(obj["data"])                # often float64 even for counts
+            indices = read(obj["indices"])             # gene indices, 0-based
+            indptr  = read(obj["indptr"])              # per-cell offsets, 0-based
+            # CSR(cells x genes) == CSC(genes x cells): reuse the arrays as-is.
+            SparseMatrixCSC{Int64,Int64}(n_genes, n_cells,
+                                         Vector{Int64}(indptr) .+ 1,
+                                         Vector{Int64}(indices) .+ 1,
+                                         Vector{Int64}(data))
+        else
+            # Dense on-disk: h5ad is row-major (cells, genes), which HDF5.jl
+            # reads column-major as (genes, cells) already.
+            read(obj)
+        end
+
         return counts, cell_ids, gene_ids
     end
 end
@@ -117,6 +165,17 @@ function subset_counts(counts::AbstractMatrix, cell_ids::Vector{String},
 end
 
 """
+Mean per-cell total over the selected genes — the target library size handed to
+OnlinePCA as `cper`. Matches `centerSizeFactors()` in the NORM stage, which
+centers size factors at 1 (equivalently: rescale every cell to the mean library
+size) before the log.
+
+Computed over the *subset* matrix, because `Sample_NoCounts.csv` from
+`tenxsumr`/`sumr` is likewise per-cell sums of the selected genes only.
+"""
+mean_colsum(X::SparseMatrixCSC) = Float32(nnz(X) == 0 ? 1.0 : sum(X) / size(X, 2))
+
+"""
 Write a sparse (genes x cells) Int matrix to a TENx-format HDF5
 that OnlinePCA.jl reads via `loadchromium`.
 """
@@ -136,14 +195,203 @@ function write_tenx_h5(path::AbstractString, X::SparseMatrixCSC,
     end
 end
 
+"""
+Parse a `{algorithm}_{scale}` solver token. Returns (algorithm, scale, rowmean_csv).
+
+The per-row-mean file name depends on the scale because OnlinePCA.sumr writes
+one CSV per transform (Feature_Means / Feature_LogMeans / Feature_SqrtMeans
+/ Feature_FTTMeans). Each algorithm only supports a subset of scales; this
+function also validates that the combination is admissible.
+"""
 function parse_solver(solver::AbstractString)
-    @assert startswith(solver, "tenxpca_")
-    scale = String(split(solver, "_"; limit=2)[2])
-    @assert scale in ("sqrt", "log", "raw")
+    parts = split(solver, "_"; limit=2)
+    @assert length(parts) == 2 "solver must be of form {algorithm}_{scale}, got: $solver"
+    algorithm = String(parts[1])
+    scale = String(parts[2])
+
     rowmean = scale == "raw"  ? "Feature_Means.csv" :
               scale == "log"  ? "Feature_LogMeans.csv" :
-                                "Feature_SqrtMeans.csv"
-    return scale, rowmean
+              scale == "sqrt" ? "Feature_SqrtMeans.csv" :
+              scale == "ftt"  ? "Feature_FTTMeans.csv" :
+                                error("unknown scale: $scale")
+
+    valid_scales = Dict("tenxpca" => ("sqrt", "log", "raw"),
+                        "algorithm971" => ("log", "ftt", "raw"))
+    @assert haskey(valid_scales, algorithm) "unknown algorithm: $algorithm"
+    @assert scale in valid_scales[algorithm] "algorithm $algorithm does not support scale $scale"
+
+    return algorithm, scale, rowmean
+end
+
+"""
+Write a sparse (genes x cells) integer matrix in MatrixMarket coordinate
+format. The header is the bare minimum that OnlinePCA.mm2bin accepts: one
+banner line followed by `nrows ncols nnz` and the triplets. No comment
+lines (mm2bin parses dimensions from line 2 unconditionally).
+"""
+function write_mm(path::AbstractString, X::SparseMatrixCSC)
+    n_rows, n_cols = size(X)
+    nz = nnz(X)
+    open(path, "w") do io
+        println(io, "%%MatrixMarket matrix coordinate integer general")
+        println(io, "$n_rows $n_cols $nz")
+        rows = rowvals(X)
+        vals = nonzeros(X)
+        for col in 1:n_cols
+            for k in nzrange(X, col)
+                println(io, "$(rows[k]) $col $(vals[k])")
+            end
+        end
+    end
+end
+
+"""
+Run OnlinePCA.tenxpca on a sparse (genes x cells) Int matrix.
+
+Bypasses the broken kwargs wrapper at OnlinePCA commit bfb2f75 (see BUG.md).
+Returns (V, loadings, variance_per_pc, total_variance) — see `scanpy_scores`
+for why V (unit-norm) rather than OnlinePCA's own `Scores`.
+"""
+function run_tenxpca(X::SparseMatrixCSC, gene_ids::Vector{String},
+                     cell_ids::Vector{String}, scale::AbstractString,
+                     rowmean::AbstractString, dim::Integer,
+                     workdir::AbstractString)
+    tenxfile = joinpath(workdir, "subset.h5")
+    write_tenx_h5(tenxfile, X, gene_ids, cell_ids)
+
+    OnlinePCA.tenxsumr(tenxfile = tenxfile, outdir = workdir,
+                       group = TENX_GROUP)
+
+    rml = joinpath(workdir, rowmean)
+    rvl = ""        # rowvarlist: skip per-row variance scaling
+    # colsumlist: per-cell totals (required for scale ∈ {sqrt, log};
+    # tenxinit defaults colsumvec to zeros when this is "", which makes
+    # tenxnormalizex divide by 0 → NaN/Inf → LU crash).
+    csl = scale == "raw" ? "" : joinpath(workdir, "Sample_NoCounts.csv")
+    noversamples = 5
+    niter = 3
+    chunksize = 5000
+    # cper is the target library size: OnlinePCA computes
+    #   cper * x / colsum   then   log10(. + pseudocount) / sqrt(.)
+    # (Utils.jl:1412-1422). With cper = 1 the values land around 1e-4, so
+    # log10(1e-4 + 1) ~ 4e-5 and the VST is very nearly the identity -- the
+    # "log" and "sqrt" scales collapse toward raw, on a hugely shrunken scale.
+    # The NORM stage uses centerSizeFactors(), i.e. size factors centered at 1,
+    # which is exactly rescaling to the MEAN library size before the log. Match
+    # that so this branch differs from the others in solver, not in target scale.
+    cper = mean_colsum(X)
+    perm = false
+
+    W, D, rowmeanvec, rowvarvec, colsumvec, N, M, TotalVar, idp =
+        OnlinePCA.tenxinit(tenxfile, dim, chunksize, TENX_GROUP,
+                           rml, rvl, csl, nothing, nothing, nothing,
+                           cper, scale, perm)
+    pca_alg = OnlinePCA.TENXPCA()
+    out = OnlinePCA.tenxpca(tenxfile, nothing, scale, rml, rvl, csl,
+                            dim, noversamples, niter, chunksize, nothing,
+                            pca_alg, W, D, rowmeanvec, rowvarvec, colsumvec,
+                            N, M, TotalVar, perm, idp, TENX_GROUP, cper)
+    # tenxpca returns: (V, λ, U, Scores, ExpVar, TotalVar)
+    return Matrix{Float64}(out[1]),  # V, cells x dim, unit-norm columns
+           Matrix{Float64}(out[3]),  # loadings (U)
+           Vector{Float64}(out[2]),  # variance per PC (λ)
+           Float64(out[6])           # total variance
+end
+
+"""
+Run OnlinePCA.algorithm971 (Linderman/Li/Rokhlin 2017 randomized SVD
+designed for large sparse single-cell matrices) on a sparse (genes x cells)
+Int matrix.
+
+I/O path:
+  X  →  MatrixMarket file  →  mm2bin (.zst)  →  sumr (per-row/col stats)
+                                                     ↓
+                                              algorithm971
+
+Returns (V, loadings, variance_per_pc, total_variance).
+"""
+function run_algorithm971(X::SparseMatrixCSC, scale::AbstractString,
+                          rowmean::AbstractString, dim::Integer,
+                          workdir::AbstractString)
+    mmfile  = joinpath(workdir, "subset.mtx")
+    binfile = joinpath(workdir, "subset.zst")
+    write_mm(mmfile, X)
+    OnlinePCA.mm2bin(mmfile = mmfile, binfile = binfile)
+
+    # sumr in sparse_mm mode reads the (row, col, val) triplets emitted by
+    # mm2bin and writes per-row/per-column statistics CSVs to outdir.
+    OnlinePCA.sumr(binfile = binfile, outdir = workdir, mode = "sparse_mm")
+
+    rml = joinpath(workdir, rowmean)
+    rvl = ""    # rowvarlist: skip per-row variance scaling
+    csl = scale == "raw" ? "" : joinpath(workdir, "Sample_NoCounts.csv")
+    noversamples = 5
+    niter = 3
+    cper = mean_colsum(X)   # see run_tenxpca for why not 1.0
+
+    out = OnlinePCA.algorithm971(
+        input = binfile,
+        outdir = nothing,
+        scale = scale,
+        pseudocount = 1.0f0,
+        rowmeanlist = rml,
+        rowvarlist = rvl,
+        colsumlist = csl,
+        dim = dim,
+        noversamples = noversamples,
+        niter = niter,
+        perm = false,
+        cper = cper,
+    )
+    # algorithm971 returns: (V, λ, U, Scores, ExpVar, TotalVar) — same layout
+    # as tenxpca per the docstring.
+    return Matrix{Float64}(out[1]),  # V, cells x dim, unit-norm columns
+           Matrix{Float64}(out[3]),  # loadings (U)
+           Vector{Float64}(out[2]),  # variance per PC (λ)
+           Float64(out[6])           # total variance
+end
+
+"""
+Convert OnlinePCA's right singular vectors to the embedding convention used by
+scanpy and scrapper.
+
+OnlinePCA (`src/algorithm971.jl:180-190`, and identically in tenxpca) computes
+
+    W, σ, V = svd(B);  λ = σ .* σ ./ M;  Scores[:, n] = λ[n] .* V[:, n]
+
+with M = number of cells. scanpy/scrapper instead write σ·V. Emitting λ·V would
+reweight the PCs by an extra factor of σ/M each, which propagates straight into
+the kNN graph and the clustering metrics — the benchmark would then be partly
+measuring the scaling convention rather than the solver. So recover σ and apply
+it: σ = sqrt(λ · M).
+
+(OnlinePCA divides by M where a sample covariance would use M-1; the resulting
+sqrt(M/(M-1)) discrepancy is a uniform scalar across all PCs, so it shifts no
+neighbour ordering.)
+"""
+function scanpy_scores(V::AbstractMatrix, λ::AbstractVector, n_cells::Integer)
+    σ = sqrt.(λ .* n_cells)
+    return V .* σ'
+end
+
+"""
+Write a matrix as the benchmark's embedding/loadings TSV: one header line
+(`row_label`, then `dim_1..dim_k`) followed by one row per entry prefixed with
+its id. Matches scanpy's `src/writers.py::_write_tsv` and scrapper's
+`fwrite(data.frame(cell_id = ..., ...))`, which is what the downstream readers
+expect (`knn.py` skips one header row and takes column 0 as the id;
+`metrics/embedding` joins on the `cell_id` column by name).
+"""
+function write_tsv(path::AbstractString, M::AbstractMatrix,
+                   row_ids::Vector{String}, row_label::AbstractString)
+    n_rows, n_cols = size(M)
+    @assert length(row_ids) == n_rows "row_ids ($(length(row_ids))) != rows ($n_rows)"
+    open(path, "w") do io
+        println(io, row_label, "\t", join(("dim_$i" for i in 1:n_cols), "\t"))
+        for i in 1:n_rows
+            println(io, row_ids[i], "\t", join(view(M, i, :), "\t"))
+        end
+    end
 end
 
 function tool_version()
@@ -181,7 +429,7 @@ function main()
 
     println("Full command: ", join(ARGS, " "))
     for k in ("output_dir", "name", "rawdata_h5ad", "filtered_cellids",
-              "selected_genes", "solver", "n_components", "random_seed")
+              "normalized_selected_h5", "solver", "n_components", "random_seed")
         println("  $k: $(args[k])")
     end
 
@@ -189,7 +437,7 @@ function main()
     mkpath(args["output_dir"])
 
     keep_cells = load_lines(args["filtered_cellids"])
-    keep_genes = load_lines(args["selected_genes"])
+    keep_genes = load_selected_genes(args["normalized_selected_h5"])
     println("  filtered cells: $(length(keep_cells))")
     println("  selected genes: $(length(keep_genes))")
 
@@ -201,63 +449,42 @@ function main()
     n_genes, n_cells = size(X)
     println("  subset (genes x cells): ($n_genes, $n_cells), nnz=$(nnz(X))")
 
+    algorithm, scale, rowmean = parse_solver(args["solver"])
+    dim = args["n_components"]
+    println("  dispatch: algorithm=$algorithm, scale=$scale")
+
     workdir = mktempdir()
     try
-        tenxfile = joinpath(workdir, "subset.h5")
-        write_tenx_h5(tenxfile, X, gene_ids, cell_ids)
+        V, loadings, λ, TotalVar = if algorithm == "tenxpca"
+            run_tenxpca(X, gene_ids, cell_ids, scale, rowmean, dim, workdir)
+        elseif algorithm == "algorithm971"
+            run_algorithm971(X, scale, rowmean, dim, workdir)
+        else
+            error("unhandled algorithm: $algorithm")
+        end
 
-        scale, rowmean = parse_solver(args["solver"])
-
-        OnlinePCA.tenxsumr(tenxfile = tenxfile, outdir = workdir,
-                           group = TENX_GROUP)
-
-        # NOTE: bypass the kwargs wrapper OnlinePCA.tenxpca(; ...) — at the
-        # pinned commit (bfb2f75) it has a bug at tenxpca.jl:43 where it
-        # references an undefined `pca` symbol (every sibling solver
-        # initializes `pca = HALKO()` / `CCIPCA()` / etc.; tenxpca.jl is
-        # missing the analogous `pca = TENXPCA()` line). Call the
-        # positional-args inner method ourselves with a TENXPCA() instance.
-        rml = joinpath(workdir, rowmean)
-        rvl = ""        # rowvarlist: skip per-row variance scaling
-        # colsumlist: per-cell totals (required for scale ∈ {sqrt, log};
-        # tenxinit defaults colsumvec to zeros when this is "", which makes
-        # tenxnormalizex divide by 0 → NaN/Inf → LU crash).
-        csl = scale == "raw" ? "" : joinpath(workdir, "Sample_NoCounts.csv")
-        dim = args["n_components"]
-        noversamples = 5
-        niter = 3
-        chunksize = 5000
-        cper = 1.0f0
-        perm = false
-
-        W, D, rowmeanvec, rowvarvec, colsumvec, N, M, TotalVar, idp =
-            OnlinePCA.tenxinit(tenxfile, dim, chunksize, TENX_GROUP,
-                               rml, rvl, csl, nothing, nothing, nothing,
-                               cper, scale, perm)
-        pca_alg = OnlinePCA.TENXPCA()
-        out = OnlinePCA.tenxpca(tenxfile, nothing, scale, rml, rvl, csl,
-                                dim, noversamples, niter, chunksize, nothing,
-                                pca_alg, W, D, rowmeanvec, rowvarvec, colsumvec,
-                                N, M, TotalVar, perm, idp, TENX_GROUP, cper)
-        # tenxpca returns: (V, λ, U, Scores, ExpVar, TotalVar) where
-        #   λ        : per-PC eigenvalue (variance per PC)        — out[2]
-        #   U        : loadings, n_genes × dim                    — out[3]
-        #   Scores   : PC scores, n_cells × dim                   — out[4]
-        #   ExpVar   : SCALAR, sum(λ)/TotalVar (total fraction)   — out[5]
-        #   TotalVar : SCALAR, total variance of scaled matrix    — out[6]
-        Scores   = Matrix{Float64}(out[4])
-        loadings = Matrix{Float64}(out[3])
-        λ        = Vector{Float64}(out[2])
-        TotalVar = Float64(out[6])
-
+        embedding      = scanpy_scores(V, λ, n_cells)
         variance       = λ
         variance_ratio = TotalVar > 0 ? λ ./ TotalVar : zeros(length(λ))
 
-        println("  embedding: $(size(Scores)), loadings: $(size(loadings))")
+        println("  embedding: $(size(embedding)), loadings: $(size(loadings))")
 
+        # The two stage-declared outputs. Cell ids are the post-drop vector, so
+        # a zero-count cell simply doesn't appear; every downstream consumer
+        # joins on cell_id (metrics/{embedding,graph,cluster}) or reads the ids
+        # off the embedding itself (scanpy knn.py).
+        pcas_path = joinpath(args["output_dir"], "$(args["name"])_pcas.tsv")
+        loadings_path = joinpath(args["output_dir"], "$(args["name"])_loadings.tsv")
+        write_tsv(pcas_path, embedding, cell_ids, "cell_id")
+        write_tsv(loadings_path, loadings, gene_ids, "gene_id")
+        println("  wrote: $pcas_path")
+        println("  wrote: $loadings_path")
+
+        # Undeclared, but the only place the eigenvalues and total variance
+        # survive; the TSV contract carries neither.
         outpath = joinpath(args["output_dir"],
                            "$(args["name"])_$(args["solver"])_n_$(args["n_components"]).h5")
-        write_output(outpath, Scores, loadings, variance, variance_ratio,
+        write_output(outpath, embedding, loadings, variance, variance_ratio,
                      cell_ids, gene_ids, args)
         println("  wrote: $outpath")
     finally

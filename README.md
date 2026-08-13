@@ -36,14 +36,6 @@ Input is the **raw count h5ad** from the upstream `datasets` stage (read from `/
 
 Output: `<output_dir>/<name>_<solver>_n_<n_components>.h5` — see [`docs/pca_output.md`](docs/pca_output.md) for the full format spec.
 
-#### Validation
-
-```sh
-pixi run validate <output_dir>/<name>_pca.h5
-```
-
-Exit codes: `0` = valid, `1` = validation failure, `2` = IO / usage error.
-
 ## Cell dropout
 
 After subsetting raw counts to `--selected.genes`, some kept cells may have **zero total counts across the selected gene set**. OnlinePCA.jl's `tenxnormalizex` divides by per-cell totals for `scale ∈ {sqrt, log}`, so empty cells produce `NaN`/`Inf` and crash the LU step. This module drops such cells before running the SVD.

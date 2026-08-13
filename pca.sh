@@ -13,6 +13,15 @@ NTHREADS="${JULIA_NUM_THREADS:-${SLURM_CPUS_PER_TASK:-1}}"
 
 # Idempotent: Pkg.instantiate() is a no-op when the project is already
 # resolved against an existing Manifest.toml.
-julia --project="$HERE" -e 'using Pkg; Pkg.instantiate()' >&2
+#
+# ponytail: serialized with flock -- parallel jobs share one depot and
+# racing builds collide (WebIO's build.jl `cp`s bundles onto files a
+# sibling already installed read-only -> EACCES). Julia's own pidfiles
+# cover precompile but not Pkg build. Drop the lock once the depot is
+# pre-warmed at env-build time instead of per-job.
+DEPOT="${JULIA_DEPOT_PATH:-$HOME/.julia}"; DEPOT="${DEPOT%%:*}"
+mkdir -p "$DEPOT"
+flock "$DEPOT/.ob-instantiate.lock" \
+  julia --project="$HERE" -e 'using Pkg; Pkg.instantiate()' >&2
 
 exec julia --project="$HERE" -t "$NTHREADS" "$HERE/pca.jl" "$@"
