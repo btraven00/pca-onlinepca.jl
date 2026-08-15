@@ -116,8 +116,141 @@ function load_h5ad_counts(path::AbstractString)
 end
 
 """
+Read `/layers/counts` already subset to the kept cells and genes, without ever
+holding the full matrix.
+
+Why this exists: the raw h5ad carries every gene (36753 on the be1 fixture)
+while FEAT keeps 2000, and the straightforward path -- read everything, then
+mask -- peaked at ~540MB on that fixture before OnlinePCA had run at all. Two
+costs stack there. The stored `data` is float64 and `indices` int32, so
+converting both to Int64 allocates full-size copies, and `Vector{Int64}(x) .+ 1`
+allocates a second one; and none of that work is needed for the ~5% of rows
+that survive selection.
+
+Here the nonzeros are read in cell-sized chunks and filtered on the way in, so
+peak memory tracks the *kept* matrix rather than the stored one. Row indices
+stay sorted within each column because `gene_row` is monotone in the original
+gene order, which is what SparseMatrixCSC requires.
+
+Returns (X::SparseMatrixCSC{Int64,Int64} genes x cells, kept_cells, kept_genes),
+matching subset_counts.
+"""
+function load_counts_subset(path::AbstractString,
+                            keep_cells::Vector{<:AbstractString},
+                            keep_genes::Vector{<:AbstractString};
+                            chunk_cells::Integer = 4096)
+    h5open(path, "r") do h5
+        haskey(h5, "layers") && haskey(h5["layers"], "counts") ||
+            error("expected /layers/counts in $path")
+        obj = h5["layers"]["counts"]
+        cell_ids = String.(read(h5["obs"]["_index"]))
+        gene_ids = String.(read(h5["var"]["_index"]))
+
+        # Dense fallback: rare, and small enough that masking in memory is fine.
+        if !(obj isa HDF5.Group)
+            return subset_counts(read(obj), cell_ids, gene_ids, keep_cells, keep_genes)
+        end
+        enc = haskey(attrs(obj), "encoding-type") ? attrs(obj)["encoding-type"] : ""
+        enc == "csr_matrix" ||
+            error("/layers/counts is a $enc group; only csr_matrix (cells x genes) is supported")
+
+        cell_set, gene_set = Set(keep_cells), Set(keep_genes)
+        miss_c = setdiff(cell_set, Set(cell_ids))
+        if !isempty(miss_c)
+            sample = sort(collect(miss_c))[1:min(10, end)]
+            error("$(length(miss_c)) filtered cell(s) not in h5ad; first $(length(sample)): $(sample)")
+        end
+        miss_g = setdiff(gene_set, Set(gene_ids))
+        if !isempty(miss_g)
+            sample = sort(collect(miss_g))[1:min(10, end)]
+            error("$(length(miss_g)) selected gene(s) not in h5ad; first $(length(sample)): $(sample)")
+        end
+
+        shape = attrs(obj)["shape"]
+        n_cells, n_genes = Int(shape[1]), Int(shape[2])
+        length(gene_ids) == n_genes || error("var/_index ($(length(gene_ids))) != shape genes ($n_genes)")
+        length(cell_ids) == n_cells || error("obs/_index ($(length(cell_ids))) != shape cells ($n_cells)")
+
+        # 0 marks a dropped gene; otherwise the row it becomes in the subset.
+        gene_row = zeros(Int64, n_genes)
+        r = 0
+        for (j, g) in enumerate(gene_ids)
+            if g in gene_set
+                r += 1
+                gene_row[j] = r
+            end
+        end
+        kept_genes = gene_ids[gene_row .> 0]
+        cell_keep  = [c in cell_set for c in cell_ids]
+        n_keep     = count(cell_keep)
+
+        indptr = Vector{Int64}(read(obj["indptr"]))    # 0-based, length n_cells+1
+        d_set, i_set = obj["data"], obj["indices"]
+
+        # One read per chunk. Survivors are counted from the copy already in
+        # memory and the output grown by exactly that much, so there is neither
+        # a second pass over the file nor the repeated doubling that a push!
+        # loop would do -- guessing the final size up front is badly wrong
+        # anyway, since selected genes are far denser than average ones.
+        colptr = Vector{Int64}(undef, n_keep + 1); colptr[1] = 1
+        rowval, nzval = Int64[], Int64[]
+
+        col, at = 0, 0
+        for lo in 1:chunk_cells:n_cells
+            hi = min(lo + chunk_cells - 1, n_cells)
+            a, b = indptr[lo] + 1, indptr[hi + 1]      # 1-based inclusive slice
+            d, ix = if b >= a
+                (d_set[a:b], i_set[a:b])               # hyperslab: this chunk only
+            else
+                (Float64[], Int32[])                   # all-empty cells in range
+            end
+
+            m = 0
+            for c in lo:hi
+                cell_keep[c] || continue
+                @inbounds for p in (indptr[c] + 1):indptr[c + 1]
+                    m += (gene_row[Int(ix[p - a + 1]) + 1] != 0)
+                end
+            end
+            resize!(rowval, at + m); resize!(nzval, at + m)
+
+            for c in lo:hi
+                cell_keep[c] || continue
+                col += 1
+                @inbounds for p in (indptr[c] + 1):indptr[c + 1]
+                    g = gene_row[Int(ix[p - a + 1]) + 1]
+                    if g != 0
+                        at += 1
+                        rowval[at] = g
+                        nzval[at]  = Int64(d[p - a + 1])
+                    end
+                end
+                colptr[col + 1] = at + 1
+            end
+        end
+
+        X = SparseMatrixCSC{Int64,Int64}(r, n_keep, colptr, rowval, nzval)
+        kept_cells = cell_ids[cell_keep]
+
+        # Same guard as subset_counts: OnlinePCA's tenxnormalizex divides by
+        # per-cell sums for scale in {sqrt, log}, so a zero-sum cell gives
+        # NaN/Inf and crashes LU.
+        nonempty = vec(sum(X; dims = 1)) .> 0
+        if !all(nonempty)
+            println("  dropped $(count(.!nonempty)) cell(s) with zero counts across selected genes")
+            X = X[:, nonempty]
+            kept_cells = kept_cells[nonempty]
+        end
+
+        return X, kept_cells, kept_genes
+    end
+end
+
+"""
 Subset (genes x cells) dense counts to selected genes/cells and return
 a sparse genes-as-rows Int matrix plus aligned id vectors.
+
+Kept for the dense-on-disk path; the CSR path uses load_counts_subset.
 """
 function subset_counts(counts::AbstractMatrix, cell_ids::Vector{String},
                        gene_ids::Vector{String},
@@ -246,6 +379,53 @@ function write_mm(path::AbstractString, X::SparseMatrixCSC)
 end
 
 """
+Write the two summary files `tenxpca` actually reads, in place of calling
+`OnlinePCA.tenxsumr`.
+
+This is a workaround for upstream, not for anything in this module. Measured on
+sc-mix (2000 genes x 3918 cells, a 22MB TENx file), `tenxsumr` adds **+998MB**
+of peak RSS while `tenxpca` itself adds none. Two upstream causes, both in
+OnlinePCA/src/tenxsumr.jl:
+
+  * `tenxstats` computes 25 statistics -- means and variances, each raw/log/
+    sqrt, each again under CPM/CPT/CPMED, plus CV2 -- and holds twelve full
+    materialised copies of the chunk at once (X, logX, sqrtX, cpmX, logcpmX,
+    sqrtcpmX, cptX, ..., sqrtcpmedX). With the default chunksize of 5000 and a
+    2000-gene subset, the "chunk" is the entire matrix.
+  * the `1e6 .* X ./ nc'` scalings promote those copies to Float64.
+
+Of the 25, `run_tenxpca` reads exactly two, and X is already in memory here.
+
+Definitions are copied from `tenxstats`/`tenxnocounts` so the files stay
+byte-compatible with what tenxsumr would have written:
+  Sample_NoCounts.csv   UInt32 per-cell totals (sum over rows)
+  Feature_*Means.csv    row means over ALL cells, zeros included, under the
+                        scale's transform: identity, log10(x+1), or sqrt(x)
+"""
+function write_sumr_csvs(X::SparseMatrixCSC, workdir::AbstractString,
+                         scale::AbstractString, rowmean::AbstractString)
+    n_genes, n_cells = size(X)
+
+    # tenxnocounts accumulates into a UInt32 vector; match the type so the CSV
+    # is written as integers rather than 1234.0.
+    nc = UInt32.(vec(sum(X, dims = 1)))
+    writedlm(joinpath(workdir, "Sample_NoCounts.csv"), nc, ',')
+
+    nz = if scale == "raw"
+        X.nzval
+    elseif scale == "log"
+        log10.(X.nzval .+ 1)          # sparseLog10
+    elseif scale == "sqrt"
+        sqrt.(X.nzval)
+    else
+        error("unsupported scale for the direct summary path: $scale")
+    end
+    T = SparseMatrixCSC(n_genes, n_cells, X.colptr, X.rowval, nz)
+    # mean over dims=2 counts the structural zeros, hence /n_cells not /nnz
+    writedlm(joinpath(workdir, rowmean), vec(sum(T, dims = 2)) ./ n_cells, ',')
+end
+
+"""
 Run OnlinePCA.tenxpca on a sparse (genes x cells) Int matrix.
 
 Bypasses the broken kwargs wrapper at OnlinePCA commit bfb2f75 (see BUG.md).
@@ -259,8 +439,11 @@ function run_tenxpca(X::SparseMatrixCSC, gene_ids::Vector{String},
     tenxfile = joinpath(workdir, "subset.h5")
     write_tenx_h5(tenxfile, X, gene_ids, cell_ids)
 
-    OnlinePCA.tenxsumr(tenxfile = tenxfile, outdir = workdir,
-                       group = TENX_GROUP)
+    # was: OnlinePCA.tenxsumr(tenxfile = tenxfile, outdir = workdir,
+    #                         group = TENX_GROUP)
+    # See write_sumr_csvs: same two files, without tenxsumr's 23 unused
+    # statistics and its twelve simultaneous copies of the matrix.
+    write_sumr_csvs(X, workdir, scale, rowmean)
 
     rml = joinpath(workdir, rowmean)
     rvl = ""        # rowvarlist: skip per-row variance scaling
@@ -441,11 +624,10 @@ function main()
     println("  filtered cells: $(length(keep_cells))")
     println("  selected genes: $(length(keep_genes))")
 
-    counts, all_cells, all_genes = load_h5ad_counts(args["rawdata_h5ad"])
-    println("  raw counts (cells x genes): $(size(counts))")
-
-    X, cell_ids, gene_ids = subset_counts(counts, all_cells, all_genes,
-                                          keep_cells, keep_genes)
+    # Selection happens inside the read: the raw h5ad holds every gene, and
+    # materialising all of them only to drop 95% dominated this module's memory.
+    X, cell_ids, gene_ids = load_counts_subset(args["rawdata_h5ad"],
+                                               keep_cells, keep_genes)
     n_genes, n_cells = size(X)
     println("  subset (genes x cells): ($n_genes, $n_cells), nnz=$(nnz(X))")
 
