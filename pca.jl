@@ -379,6 +379,37 @@ function write_mm(path::AbstractString, X::SparseMatrixCSC)
 end
 
 """
+Gene-chunk size for tenxinit/tenxpca.
+
+`chunksize` is what makes OnlinePCA's out-of-core path actually stream: each
+chunk is a gene range, and `loadchromium` holds that range's nonzeros across
+all cells. With the previous hardcoded 5000 against a 2000-gene subset there
+was a single chunk, i.e. the whole matrix in memory and no streaming at all.
+Measured on sc-mix, tenxpca's own peak:
+
+    chunksize 5000  +491MB / 8.4s     501  +107MB / 12.1s
+              1001  +277MB / 9.6s     251   +35MB / 16.9s
+
+Eight chunks trades roughly 2x the tenxpca time for ~14x less memory, which is
+the right way round for a step that was 2GB.
+
+The `+ 1` is not cosmetic. Upstream computes `lasti = fld(N, chunksize) + 1`,
+so when chunksize divides N exactly it emits one chunk too many, starting past
+the last gene; `loadchromium` then hits `@assert minimum(newindices) >= startp`
+on an empty vector and dies with "reducing over an empty collection"
+(Utils.jl:143). Landing on a size that does not divide N avoids the empty tail
+chunk entirely.
+"""
+function gene_chunksize(n_genes::Integer; target_chunks::Integer = 8)
+    cs = max(64, cld(n_genes, target_chunks))
+    # cs == n_genes is the worst case, not a safe one: fld(N, N) + 1 == 2, and
+    # the second chunk is empty. Going strictly above N gives fld == 0, hence a
+    # single chunk, which is what upstream's own default relied on.
+    cs >= n_genes && return n_genes + 1
+    return n_genes % cs == 0 ? cs + 1 : cs
+end
+
+"""
 Write the two summary files `tenxpca` actually reads, in place of calling
 `OnlinePCA.tenxsumr`.
 
@@ -453,7 +484,7 @@ function run_tenxpca(X::SparseMatrixCSC, gene_ids::Vector{String},
     csl = scale == "raw" ? "" : joinpath(workdir, "Sample_NoCounts.csv")
     noversamples = 5
     niter = 3
-    chunksize = 5000
+    chunksize = gene_chunksize(size(X, 1))
     # cper is the target library size: OnlinePCA computes
     #   cper * x / colsum   then   log10(. + pseudocount) / sqrt(.)
     # (Utils.jl:1412-1422). With cper = 1 the values land around 1e-4, so
