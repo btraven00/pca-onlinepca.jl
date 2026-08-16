@@ -638,7 +638,8 @@ function run_tenxpca_streamed(h5ad::AbstractString,
                               keep_cells::Vector{<:AbstractString},
                               keep_genes::Vector{<:AbstractString},
                               scale::AbstractString, rowmean::AbstractString,
-                              dim::Integer, workdir::AbstractString)
+                              dim::Integer, workdir::AbstractString;
+                              gene_chunks::Integer = 8)
     tenxfile = joinpath(workdir, "subset.h5")
     st = stream_h5ad_to_tenx(h5ad, tenxfile, keep_cells, keep_genes, scale)
 
@@ -650,7 +651,7 @@ function run_tenxpca_streamed(h5ad::AbstractString,
     csl = scale == "raw" ? "" : joinpath(workdir, "Sample_NoCounts.csv")
     # mean_colsum(X) == mean of the per-cell totals, which pass 1 already has.
     cper = Float32(st.nnz == 0 ? 1.0 : sum(st.nocounts) / st.n_cells)
-    chunksize = gene_chunksize(st.n_genes)
+    chunksize = gene_chunksize(st.n_genes; target_chunks = gene_chunks)
 
     W, D, rowmeanvec, rowvarvec, colsumvec, N, M, TotalVar, idp =
         OnlinePCA.tenxinit(tenxfile, dim, chunksize, TENX_GROUP,
@@ -846,6 +847,10 @@ function write_output(path::AbstractString,
         attrs(h5)["solver"] = args["solver"]
         attrs(h5)["n_components"] = args["n_components"]
         attrs(h5)["random_seed"] = args["random_seed"]
+        # Recorded because it is not numerically inert: chunk boundaries change
+        # the Float32 accumulation order, so two runs differing only in
+        # gene_chunks are not bit-comparable.
+        attrs(h5)["gene_chunks"] = args["gene_chunks"]
     end
 end
 
@@ -880,7 +885,8 @@ function main()
         V, loadings, λ, TotalVar = if algorithm == "tenxpca"
             v, l, lam, tv, st = run_tenxpca_streamed(args["rawdata_h5ad"],
                                                      keep_cells, keep_genes,
-                                                     scale, rowmean, dim, workdir)
+                                                     scale, rowmean, dim, workdir;
+                                                     gene_chunks = args["gene_chunks"])
             cell_ids, gene_ids = st.kept_cells, st.kept_genes
             n_genes, n_cells = st.n_genes, st.n_cells
             println("  subset (genes x cells): ($n_genes, $n_cells), nnz=$(st.nnz)")

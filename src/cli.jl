@@ -80,6 +80,17 @@ function build_pca_parser()
             help = "Seed for randomized solvers (and for reproducibility)"
             arg_type = Int
             required = true
+        # Optional with a default, so plans that do not set it are unaffected
+        # and their parameter hashes do not move.
+        "--gene_chunks"
+            help = "Gene chunks for the out-of-core pass. More chunks means " *
+                   "less memory and more I/O, because upstream re-reads the " *
+                   "whole file once per chunk (8: ~166MB and 16s on sc-mix; " *
+                   "32: ~109MB and 41s, and flat in cell count). Default 8"
+            arg_type = Int
+            required = false
+            default = 8
+            range_tester = (x -> x >= 1)
     end
 
     return s
