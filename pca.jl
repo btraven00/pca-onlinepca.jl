@@ -357,6 +357,175 @@ function parse_solver(solver::AbstractString)
 end
 
 """
+Stream `/layers/counts` straight from the h5ad into the TENx file `tenxpca`
+reads, never holding the whole matrix.
+
+This is what makes the module out-of-core. OnlinePCA's factorisation already
+streams -- `tenxpca` adds 0MB -- but everything in front of it did not: the
+matrix was materialised as a SparseMatrixCSC and only then written out, so
+peak grew with the data no matter how well the solver behaved.
+
+The transposition is free, which is what makes this bookkeeping rather than a
+redesign. h5ad stores CSR (cells x genes): one contiguous run per cell, listing
+gene indices in order. TENx wants CSC (genes x cells): one contiguous run per
+cell, listing gene row-indices in order. Same bytes, same order -- each cell's
+run is appended as one column. No transpose, no re-sort, and the gene remap is
+monotone so row indices stay sorted within a column.
+
+Two passes, both O(chunk) in memory:
+
+  1. read `data`+`indices` per cell-chunk; count kept nonzeros per cell, sum
+     each cell over the kept genes, and accumulate the per-gene transformed
+     sums. That fixes the exact nnz and cell count, so pass 2 can write into
+     fixed-size datasets and no extendible-dataset dance is needed.
+  2. read again and write the `data`/`indices` slabs.
+
+Cells whose kept-gene total is zero are dropped, matching what subset_counts
+did after the fact: OnlinePCA's tenxnormalizex divides by the per-cell sum for
+scale in {sqrt, log}, so a zero-sum cell yields NaN/Inf and crashes LU. Their
+contribution to the gene sums is zero under every supported transform, so
+accumulating before the drop is decided is safe -- only the divisor changes.
+
+Returns a NamedTuple with everything downstream needs in place of the matrix:
+(n_genes, n_cells, nnz, nocounts, gene_means, kept_cells, kept_genes).
+"""
+function stream_h5ad_to_tenx(path::AbstractString, tenxfile::AbstractString,
+                             keep_cells::Vector{<:AbstractString},
+                             keep_genes::Vector{<:AbstractString},
+                             scale::AbstractString;
+                             chunk_cells::Integer = 512)
+    scale in ("raw", "log", "sqrt") ||
+        error("unsupported scale for the streaming path: $scale")
+    transform = scale == "raw"  ? identity :
+                scale == "log"  ? (x -> log10(x + 1)) :
+                                  sqrt
+
+    h5open(path, "r") do h5
+        haskey(h5, "layers") && haskey(h5["layers"], "counts") ||
+            error("expected /layers/counts in $path")
+        obj = h5["layers"]["counts"]
+        obj isa HDF5.Group ||
+            error("/layers/counts is dense; the streaming path needs csr_matrix")
+        enc = haskey(attrs(obj), "encoding-type") ? attrs(obj)["encoding-type"] : ""
+        enc == "csr_matrix" ||
+            error("/layers/counts is a $enc group; only csr_matrix (cells x genes) is supported")
+
+        cell_ids = String.(read(h5["obs"]["_index"]))
+        gene_ids = String.(read(h5["var"]["_index"]))
+        cell_set, gene_set = Set(keep_cells), Set(keep_genes)
+        miss_c = setdiff(cell_set, Set(cell_ids))
+        if !isempty(miss_c)
+            sample = sort(collect(miss_c))[1:min(10, end)]
+            error("$(length(miss_c)) filtered cell(s) not in h5ad; first $(length(sample)): $(sample)")
+        end
+        miss_g = setdiff(gene_set, Set(gene_ids))
+        if !isempty(miss_g)
+            sample = sort(collect(miss_g))[1:min(10, end)]
+            error("$(length(miss_g)) selected gene(s) not in h5ad; first $(length(sample)): $(sample)")
+        end
+
+        shape = attrs(obj)["shape"]
+        n_cells_in, n_genes_in = Int(shape[1]), Int(shape[2])
+        length(gene_ids) == n_genes_in || error("var/_index != shape genes")
+        length(cell_ids) == n_cells_in || error("obs/_index != shape cells")
+
+        gene_row = zeros(Int64, n_genes_in)          # 0 = dropped
+        r = 0
+        for (j, g) in enumerate(gene_ids)
+            if g in gene_set
+                r += 1
+                gene_row[j] = r
+            end
+        end
+        kept_genes = gene_ids[gene_row .> 0]
+        cell_keep  = [c in cell_set for c in cell_ids]
+
+        indptr = Vector{Int64}(read(obj["indptr"]))
+        d_set, i_set = obj["data"], obj["indices"]
+        chunks = [(lo, min(lo + chunk_cells - 1, n_cells_in))
+                  for lo in 1:chunk_cells:n_cells_in]
+
+        # ---- pass 1: sizes, per-cell sums, per-gene sums -------------------
+        per_cell_nnz = zeros(Int64, n_cells_in)
+        per_cell_sum = zeros(Int64, n_cells_in)
+        gene_sums    = zeros(Float64, r)
+        for (lo, hi) in chunks
+            a, b = indptr[lo] + 1, indptr[hi + 1]
+            b >= a || continue
+            d, ix = d_set[a:b], i_set[a:b]
+            for c in lo:hi
+                cell_keep[c] || continue
+                @inbounds for p in (indptr[c] + 1):indptr[c + 1]
+                    g = gene_row[Int(ix[p - a + 1]) + 1]
+                    g == 0 && continue
+                    v = Int64(d[p - a + 1])
+                    per_cell_nnz[c] += 1
+                    per_cell_sum[c] += v
+                    gene_sums[g]    += transform(v)
+                end
+            end
+        end
+
+        keep = [cell_keep[c] && per_cell_sum[c] > 0 for c in 1:n_cells_in]
+        n_dropped = count(cell_keep) - count(keep)
+        n_dropped > 0 &&
+            println("  dropped $n_dropped cell(s) with zero counts across selected genes")
+        kept_cells = cell_ids[keep]
+        n_keep     = length(kept_cells)
+        total      = sum(per_cell_nnz[keep])
+
+        # TENx indptr is 0-based, one entry per kept cell plus the tail.
+        colptr = Vector{UInt32}(undef, n_keep + 1); colptr[1] = 0
+        k = 0
+        for c in 1:n_cells_in
+            keep[c] || continue
+            k += 1
+            colptr[k + 1] = colptr[k] + UInt32(per_cell_nnz[c])
+        end
+
+        # ---- pass 2: write ------------------------------------------------
+        h5open(tenxfile, "w") do out
+            g = create_group(out, TENX_GROUP)
+            d_out = create_dataset(g, "data",    Int32,  (total,))
+            i_out = create_dataset(g, "indices", UInt32, (total,))
+            at = 0
+            for (lo, hi) in chunks
+                a, b = indptr[lo] + 1, indptr[hi + 1]
+                b >= a || continue
+                d, ix = d_set[a:b], i_set[a:b]
+                buf_d, buf_i = Int32[], UInt32[]
+                for c in lo:hi
+                    keep[c] || continue
+                    @inbounds for p in (indptr[c] + 1):indptr[c + 1]
+                        gg = gene_row[Int(ix[p - a + 1]) + 1]
+                        gg == 0 && continue
+                        push!(buf_d, Int32(d[p - a + 1]))
+                        push!(buf_i, UInt32(gg - 1))      # TENx rows are 0-based
+                    end
+                end
+                if !isempty(buf_d)
+                    d_out[(at + 1):(at + length(buf_d))] = buf_d
+                    i_out[(at + 1):(at + length(buf_i))] = buf_i
+                    at += length(buf_d)
+                end
+            end
+            at == total || error("wrote $at nonzeros, expected $total")
+            write(g, "indptr",   colptr)
+            write(g, "shape",    UInt32[r, n_keep])
+            write(g, "barcodes", kept_cells)
+            feats = create_group(g, "features")
+            write(feats, "id",   kept_genes)
+            write(feats, "name", kept_genes)
+        end
+
+        return (n_genes = r, n_cells = n_keep, nnz = total,
+                nocounts = UInt32.(per_cell_sum[keep]),
+                gene_means = gene_sums ./ n_keep,
+                kept_cells = kept_cells, kept_genes = kept_genes)
+    end
+end
+
+"""
 Write a sparse (genes x cells) integer matrix in MatrixMarket coordinate
 format. The header is the bare minimum that OnlinePCA.mm2bin accepts: one
 banner line followed by `nrows ncols nnz` and the triplets. No comment
@@ -457,11 +626,53 @@ function write_sumr_csvs(X::SparseMatrixCSC, workdir::AbstractString,
 end
 
 """
+Out-of-core variant of run_tenxpca: streams the h5ad into the TENx file and
+runs the factorisation from there, so the count matrix is never in memory.
+
+Same result as the in-memory path (the TENx file and both summary CSVs are
+byte-identical, verified for raw/log/sqrt); the difference is only where the
+data lives. Returns the usual four values plus the ids and dimensions that
+main would otherwise have taken from X.
+"""
+function run_tenxpca_streamed(h5ad::AbstractString,
+                              keep_cells::Vector{<:AbstractString},
+                              keep_genes::Vector{<:AbstractString},
+                              scale::AbstractString, rowmean::AbstractString,
+                              dim::Integer, workdir::AbstractString)
+    tenxfile = joinpath(workdir, "subset.h5")
+    st = stream_h5ad_to_tenx(h5ad, tenxfile, keep_cells, keep_genes, scale)
+
+    writedlm(joinpath(workdir, "Sample_NoCounts.csv"), st.nocounts, ',')
+    writedlm(joinpath(workdir, rowmean), st.gene_means, ',')
+
+    rml = joinpath(workdir, rowmean)
+    rvl = ""
+    csl = scale == "raw" ? "" : joinpath(workdir, "Sample_NoCounts.csv")
+    # mean_colsum(X) == mean of the per-cell totals, which pass 1 already has.
+    cper = Float32(st.nnz == 0 ? 1.0 : sum(st.nocounts) / st.n_cells)
+    chunksize = gene_chunksize(st.n_genes)
+
+    W, D, rowmeanvec, rowvarvec, colsumvec, N, M, TotalVar, idp =
+        OnlinePCA.tenxinit(tenxfile, dim, chunksize, TENX_GROUP,
+                           rml, rvl, csl, nothing, nothing, nothing,
+                           cper, scale, false)
+    out = OnlinePCA.tenxpca(tenxfile, nothing, scale, rml, rvl, csl,
+                            dim, 5, 3, chunksize, nothing,
+                            OnlinePCA.TENXPCA(), W, D, rowmeanvec, rowvarvec,
+                            colsumvec, N, M, TotalVar, false, idp, TENX_GROUP, cper)
+    return Matrix{Float64}(out[1]), Matrix{Float64}(out[3]),
+           Vector{Float64}(out[2]), Float64(out[6]), st
+end
+
+"""
 Run OnlinePCA.tenxpca on a sparse (genes x cells) Int matrix.
 
 Bypasses the broken kwargs wrapper at OnlinePCA commit bfb2f75 (see BUG.md).
 Returns (V, loadings, variance_per_pc, total_variance) — see `scanpy_scores`
 for why V (unit-norm) rather than OnlinePCA's own `Scores`.
+
+Kept for algorithm971 and for the equivalence tests; the tenxpca path now goes
+through run_tenxpca_streamed.
 """
 function run_tenxpca(X::SparseMatrixCSC, gene_ids::Vector{String},
                      cell_ids::Vector{String}, scale::AbstractString,
@@ -655,22 +866,31 @@ function main()
     println("  filtered cells: $(length(keep_cells))")
     println("  selected genes: $(length(keep_genes))")
 
-    # Selection happens inside the read: the raw h5ad holds every gene, and
-    # materialising all of them only to drop 95% dominated this module's memory.
-    X, cell_ids, gene_ids = load_counts_subset(args["rawdata_h5ad"],
-                                               keep_cells, keep_genes)
-    n_genes, n_cells = size(X)
-    println("  subset (genes x cells): ($n_genes, $n_cells), nnz=$(nnz(X))")
-
     algorithm, scale, rowmean = parse_solver(args["solver"])
     dim = args["n_components"]
     println("  dispatch: algorithm=$algorithm, scale=$scale")
 
     workdir = mktempdir()
     try
+        # tenxpca streams: the h5ad goes straight to the TENx file it reads, so
+        # the count matrix is never materialised. algorithm971 still needs X in
+        # memory -- it is blocked on an unrelated format mismatch (see BUG.md),
+        # so there is nothing to gain by converting it yet.
+        local cell_ids, gene_ids, n_genes, n_cells
         V, loadings, λ, TotalVar = if algorithm == "tenxpca"
-            run_tenxpca(X, gene_ids, cell_ids, scale, rowmean, dim, workdir)
+            v, l, lam, tv, st = run_tenxpca_streamed(args["rawdata_h5ad"],
+                                                     keep_cells, keep_genes,
+                                                     scale, rowmean, dim, workdir)
+            cell_ids, gene_ids = st.kept_cells, st.kept_genes
+            n_genes, n_cells = st.n_genes, st.n_cells
+            println("  subset (genes x cells): ($n_genes, $n_cells), nnz=$(st.nnz)")
+            (v, l, lam, tv)
         elseif algorithm == "algorithm971"
+            X, cells, genes = load_counts_subset(args["rawdata_h5ad"],
+                                                 keep_cells, keep_genes)
+            cell_ids, gene_ids = cells, genes
+            n_genes, n_cells = size(X)
+            println("  subset (genes x cells): ($n_genes, $n_cells), nnz=$(nnz(X))")
             run_algorithm971(X, scale, rowmean, dim, workdir)
         else
             error("unhandled algorithm: $algorithm")
